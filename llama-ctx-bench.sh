@@ -228,7 +228,7 @@ SAFE_TARGET=$CTX_TARGET
 if [[ "$MODEL_CTX" != "n/a" ]] && is_positive_int "$MODEL_CTX"; then
     if (( CTX_TARGET + 1024 > MODEL_CTX )); then
         SAFE_TARGET=$(( MODEL_CTX - 1024 ))
-        echo -e "  ${YLW}⚠  Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer)${RST}"
+        echo -e "  ${YLW}[WARN] Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer)${RST}"
     fi
 fi
 
@@ -274,7 +274,8 @@ header "4 / 4  Results"
 
 if [[ "$HTTP_STATUS" != "200" ]]; then
     echo -e "  ${RED}Request failed — HTTP ${HTTP_STATUS}${RST}"
-    echo -e "  Server response: $(echo "$RESPONSE" | jq -r '.error.message? // .' 2>/dev/null | head -3)"
+    ERROR_MSG=$(echo "$RESPONSE" | jq -r 'if .error then .error.message // . else . // "no error field" end' 2>/dev/null || echo "unparseable response")
+    echo -e "  Server response: ${ERROR_MSG}"
     exit 1
 fi
 
@@ -316,14 +317,14 @@ if [[ "$IS_LOCAL" == true ]]; then
         KV_TOKENS_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_tokens' | awk '{print $NF}' || echo "")
         KV_USAGE_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_usage_ratio' | awk '{print $NF}' || echo "")
 
-        if [[ -n "$KV_TOKENS_POST" ]]; then
+        if [[ -n "$KV_TOKENS_POST" && "$KV_TOKENS_POST" =~ ^[0-9.]+$ ]]; then
             echo -e "\n  ${BLD}── KV cache (post-request) ───────────────────${RST}"
             echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST}${RST}"
-            if [[ -n "$KV_TOKENS_PRE" ]]; then
+            if [[ -n "$KV_TOKENS_PRE" && "$KV_TOKENS_PRE" =~ ^[0-9.]+$ ]]; then
                 KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
                 echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
             fi
-            if [[ -n "$KV_USAGE_POST" ]]; then
+            if [[ -n "$KV_USAGE_POST" && "$KV_USAGE_POST" =~ ^[0-9.]+$ ]]; then
                 KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
                 echo -e "  KV usage       : ${CYN}${KV_PCT}%${RST}"
             fi
