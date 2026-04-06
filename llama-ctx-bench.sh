@@ -154,9 +154,13 @@ else
 fi
 
 MODEL_STATUS=$(echo "$MODEL_ENTRY" | jq -r '.status.value // "unknown"')
-CHILD_PORT=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
-    grep -A 1 '^--port$' | tail -1 || echo "0")
-[[ "$CHILD_PORT" == "0" ]] && CHILD_PORT=""
+CHILD_PORT=$(echo "$MODEL_ENTRY" | jq -r '
+  .status.args // [] | 
+  . as $args | 
+  ($args | to_entries | map(select(.value == "--port")) | .[0].key // -1) as $idx | 
+  if $idx >= 0 and ($idx + 1) < ($args | length) then $args[$idx + 1] else empty end
+' 2>/dev/null)
+[[ -z "$CHILD_PORT" || "$CHILD_PORT" == "null" ]] && CHILD_PORT=""
 
 # loaded or sleeping (idle) are ready states
 if [[ "$MODEL_STATUS" == "loaded" || "$MODEL_STATUS" == "sleeping" ]]; then
@@ -168,21 +172,30 @@ fi
 [[ -n "$CHILD_PORT" ]] && echo -e "  Child port    : ${CYN}${CHILD_PORT}${RST}"
 
 # Extra config from args
-EXTRACT_ARG() { echo "$MODEL_ENTRY" | jq -r --arg a "$1" '.status.args[]?' 2>/dev/null | grep -A 1 "^$1$" | tail -1 || echo "n/a"; }
+EXTRACT_ARG() {
+    local arg="$1"
+    local val=$(echo "$MODEL_ENTRY" | jq -r --arg a "$arg" '
+      .status.args // [] | 
+      . as $args | 
+      ($args | to_entries | map(select(.value == $a)) | .[0].key // -1) as $idx | 
+      if $idx >= 0 and ($idx + 1) < ($args | length) then $args[$idx + 1] else empty end
+    ' 2>/dev/null)
+    [[ -z "$val" ]] && echo "n/a" || echo "$val"
+}
 B_SIZE=$(EXTRACT_ARG "--batch-size")
 UB_SIZE=$(EXTRACT_ARG "--ubatch-size")
 PARALLEL=$(EXTRACT_ARG "--parallel")
 REUSE=$(EXTRACT_ARG "--cache-reuse")
 RAM=$(EXTRACT_ARG "--cache-ram")
-FLASH=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | grep -A 1 '^--flash-attn$' | tail -1 || echo "off")
+FLASH=$(EXTRACT_ARG "--flash-attn")
+[[ -z "$FLASH" ]] && FLASH="off"
 
 echo -e "  Batch config  : ${CYN}batch ${B_SIZE}, ubatch ${UB_SIZE}, parallel ${PARALLEL}${RST}"
 echo -e "  Cache config  : ${CYN}reuse ${REUSE}, ram ${RAM}${RST}"
 echo -e "  Flash attention: ${CYN}${FLASH}${RST}"
 
 # extract ctx-size from model args
-MODEL_CTX=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
-    grep -A 1 '^--ctx-size$' | tail -1 || echo "n/a")
+MODEL_CTX=$(EXTRACT_ARG "--ctx-size")
 echo -e "  Configured ctx: ${CYN}${MODEL_CTX} tokens${RST}"
 
 # ── 2. child metrics (only if local and child port known) ─────────────────────
@@ -225,20 +238,19 @@ UNIT_LEN=${#REPEAT_UNIT}
 
 # Handle safety margin
 SAFE_TARGET=$CTX_TARGET
-if [[ "$MODEL_CTX" != "n/a" ]] && is_positive_int "$MODEL_CTX"; then
-    if (( CTX_TARGET + 1024 > MODEL_CTX )); then
-        SAFE_TARGET=$(( MODEL_CTX - 1024 ))
-        echo -e "  ${YLW}[WARN] Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer)${RST}"
-    fi
+if [[ "$MODEL_CTX" =~ ^[0-9]+$ ]] && (( CTX_TARGET + 1024 > MODEL_CTX )); then
+    SAFE_TARGET=$(( MODEL_CTX - 1024 ))
+    echo -e "  ${YLW}[WARN] Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer)${RST}"
 fi
 
-# Multiplier: 4.5 chars/token
-CHARS_NEEDED=$(( SAFE_TARGET * 45 / 10 ))
+# Multiplier: 4.5 chars/token (use Python for safe large-number arithmetic)
+CHARS_NEEDED=$(python3 -c "print(int($SAFE_TARGET * 4.5))")
 REPEATS=$(( CHARS_NEEDED / UNIT_LEN ))
 
 echo -e "  Filler size    : ${REPEATS} repetitions (~${CHARS_NEEDED} chars)"
 
 PAYLOAD_FILE=$(mktemp /tmp/llama-ctx-bench-XXXXXX.json)
+chmod 600 "$PAYLOAD_FILE"
 trap 'rm -f "$PAYLOAD_FILE"' EXIT
 
 python3 -c "
@@ -257,17 +269,19 @@ with open('$PAYLOAD_FILE', 'w') as fh:
 echo -e "  Sending request (timeout: ${REQUEST_TIMEOUT}s)..."
 START_TS=$(now_ms)
 
-HTTP_RESPONSE=$(curl -s -w "\n__HTTP_STATUS__%{http_code}" \
+RESPONSE_FILE=$(mktemp)
+HTTP_STATUS=$(curl -s -w "%{http_code}" -o "$RESPONSE_FILE" \
     --max-time "$REQUEST_TIMEOUT" \
     -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d "@${PAYLOAD_FILE}" 2>/dev/null || echo '{"error":"curl_failed"}\n__HTTP_STATUS__000')
+    -d "@${PAYLOAD_FILE}" 2>/dev/null)
+RESPONSE=$(cat "$RESPONSE_FILE")
+rm -f "$RESPONSE_FILE"
+
+[[ -z "$HTTP_STATUS" || "$HTTP_STATUS" == "000" ]] && HTTP_STATUS="000"
 
 END_TS=$(now_ms)
 WALL_MS=$(( END_TS - START_TS ))
-
-HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep '__HTTP_STATUS__' | sed 's/__HTTP_STATUS__//')
-RESPONSE=$(echo "$HTTP_RESPONSE" | grep -v '__HTTP_STATUS__')
 
 # ── 4. results ────────────────────────────────────────────────────────────────
 header "4 / 4  Results"
@@ -307,10 +321,16 @@ if [[ "$T_PROMPT_MS" != "0" ]]; then
 fi
 
 if [[ "$IS_LOCAL" == true ]]; then
-    # Refresh child port for metrics
+    # Refresh child port for metrics (model may have just spawned)
     MODELS_JSON2=$(curl -sf --max-time 10 "${BASE_URL}/models" 2>/dev/null || echo '{"data":[]}')
-    NEW_PORT=$(echo "$MODELS_JSON2" | jq -r --arg m "$MODEL" '.data[]? | select(.id == $m) | .status.args[]?' 2>/dev/null | grep -A 1 '^--port$' | tail -1 || echo "0")
-    [[ "$NEW_PORT" == "0" ]] && NEW_PORT="$CHILD_PORT"
+    NEW_PORT=$(echo "$MODELS_JSON2" | jq -r --arg m "$MODEL" '
+      .data[]? | select(.id == $m) | 
+      (.status.args // []) | 
+      . as $args | 
+      ($args | to_entries | map(select(.value == "--port")) | .[0].key // -1) as $idx | 
+      if $idx >= 0 and ($idx + 1) < ($args | length) then $args[$idx + 1] else empty end
+    ' 2>/dev/null)
+    [[ -z "$NEW_PORT" ]] && NEW_PORT="$CHILD_PORT"
     
     if [[ -n "$NEW_PORT" ]]; then
         CHILD_METRICS_POST=$(curl -sf --max-time 5 "http://127.0.0.1:${NEW_PORT}/metrics" 2>/dev/null || echo "")
