@@ -39,7 +39,7 @@ Options:
 
 Notes:
   - Runs against a llama-server router instance
-  - Model metrics are read from the child instance port via /v1/models
+  - Model metrics are read from the child instance port via /models
   - Remote metric endpoints (props/metrics) require SSH access to server host
     and are skipped automatically when running against a remote server
 
@@ -122,81 +122,79 @@ echo -e "  Time    : $(date '+%Y-%m-%d %H:%M:%S')"
 # ── 1. router health ──────────────────────────────────────────────────────────
 header "1 / 4  Router health & model status"
 
-MODELS_JSON=$(curl -sf --max-time 10 "${BASE_URL}/v1/models" 2>/dev/null || echo '{}')
+# Use native /models for rich metadata (discovery)
+MODELS_JSON=$(curl -sf --max-time 10 "${BASE_URL}/models" 2>/dev/null || \
+              curl -sf --max-time 10 "${BASE_URL}/v1/models" 2>/dev/null || \
+              echo '{"data":[]}')
 
-# Identify router by JSON structure (top-level role:router or presence of model args)
-IS_ROUTER=false
-if echo "$MODELS_JSON" | jq -e '.role == "router" or (.data? | type == "array" and any(.data[]; .status.args? != null))' >/dev/null 2>&1; then
-    IS_ROUTER=true
-fi
+# Check for model entry
+MODEL_ENTRY=$(echo "$MODELS_JSON" | jq -r --arg m "$MODEL" '.data[]? | select(.id == $m)' 2>/dev/null || echo "")
 
-if [[ "$IS_ROUTER" == true ]]; then
-    echo -e "  Router status : ${GRN}ok (router mode)${RST}"
-else
-    # might be a direct server, check /health
+if [[ -z "$MODEL_ENTRY" ]]; then
+    # health check fallback
     HEALTH=$(curl -sf --max-time 10 "${BASE_URL}/health" 2>/dev/null || echo '{"status":"unreachable"}')
     STATUS=$(echo "$HEALTH" | jq -r '.status // "unknown"')
     if [[ "$STATUS" != "ok" ]]; then
         echo -e "  Status : ${RED}${STATUS} — server not reachable, aborting${RST}"
         exit 1
     fi
+    echo -e "  Model status  : ${RED}not found in models list${RST}"
+    AVAILABLE_MODELS=$(echo "$MODELS_JSON" | jq -r '.data[].id' 2>/dev/null | sort | sed 's/^/    - /' || echo "    (none)")
+    echo -e "  Available models:\n${CYN}${AVAILABLE_MODELS}${RST}"
+    exit 1
+fi
+
+# Multi-model discovery based on 'args' presence
+IS_ROUTER=false
+if echo "$MODEL_ENTRY" | jq -e '.status.args? | type == "array" and length > 0' >/dev/null 2>&1; then
+    IS_ROUTER=true
+    echo -e "  Router status : ${GRN}ok (router mode)${RST}"
+else
     echo -e "  Router status : ${GRN}ok (direct server mode)${RST}"
 fi
 
-# find model in list
-MODEL_ENTRY=$(echo "$MODELS_JSON" | jq -r --arg m "$MODEL" '.data[]? | select(.id == $m)' 2>/dev/null || echo "")
+MODEL_STATUS=$(echo "$MODEL_ENTRY" | jq -r '.status.value // "unknown"')
+CHILD_PORT=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
+    grep -A 1 '^--port$' | tail -1 || echo "0")
+[[ "$CHILD_PORT" == "0" ]] && CHILD_PORT=""
 
-if [[ -z "$MODEL_ENTRY" ]]; then
-    echo -e "  Model status  : ${RED}not found in /v1/models${RST}"
-    AVAILABLE_MODELS=$(echo "$MODELS_JSON" | jq -r '.data[].id' 2>/dev/null | sort | sed 's/^/    - /' || echo "    (none)")
-    echo -e "  Available models:\n${CYN}${AVAILABLE_MODELS}${RST}"
-    echo -e "  ${RED}Aborting.${RST}"
-    exit 1
+# loaded or sleeping (idle) are ready states
+if [[ "$MODEL_STATUS" == "loaded" || "$MODEL_STATUS" == "sleeping" ]]; then
+    echo -e "  Model status  : ${GRN}${MODEL_STATUS}${RST}"
 else
-    MODEL_STATUS=$(echo "$MODEL_ENTRY" | jq -r '.status.value // "unknown"')
-    CHILD_PORT=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
-        grep -A1 '^--port$' | tail -1 || echo "0")
-    # port 0 means unloaded/not assigned
-    [[ "$CHILD_PORT" == "0" ]] && CHILD_PORT=""
-
-    if [[ "$MODEL_STATUS" == "loaded" || "$MODEL_STATUS" == "sleeping" ]]; then
-        echo -e "  Model status  : ${GRN}${MODEL_STATUS}${RST}"
-    else
-        echo -e "  Model status  : ${YLW}${MODEL_STATUS} — will load on first request (adds load time)${RST}"
-    fi
-    [[ -n "$CHILD_PORT" ]] && echo -e "  Child port    : ${CYN}${CHILD_PORT}${RST}"
-
-    # Extract extra config from args
-    EXTRACT_ARG() { echo "$MODEL_ENTRY" | jq -r --arg a "$1" '.status.args[]?' 2>/dev/null | grep -A1 "^$1$" | tail -1 || echo "n/a"; }
-    B_SIZE=$(EXTRACT_ARG "--batch-size")
-    UB_SIZE=$(EXTRACT_ARG "--ubatch-size")
-    PARALLEL=$(EXTRACT_ARG "--parallel")
-    FLASH=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | grep -A1 '^--flash-attn$' | tail -1 || echo "off")
-
-    echo -e "  Batch config  : ${CYN}batch ${B_SIZE}, ubatch ${UB_SIZE}, parallel ${PARALLEL}${RST}"
-    REUSE=$(EXTRACT_ARG "--cache-reuse")
-    RAM=$(EXTRACT_ARG "--cache-ram")
-    echo -e "  Cache config  : ${CYN}reuse ${REUSE}, ram ${RAM}${RST}"
-    echo -e "  Flash attention: ${CYN}${FLASH}${RST}"
+    echo -e "  Model status  : ${YLW}${MODEL_STATUS} — will load on first request${RST}"
 fi
+
+[[ -n "$CHILD_PORT" ]] && echo -e "  Child port    : ${CYN}${CHILD_PORT}${RST}"
+
+# Extra config from args
+EXTRACT_ARG() { echo "$MODEL_ENTRY" | jq -r --arg a "$1" '.status.args[]?' 2>/dev/null | grep -A 1 "^$1$" | tail -1 || echo "n/a"; }
+B_SIZE=$(EXTRACT_ARG "--batch-size")
+UB_SIZE=$(EXTRACT_ARG "--ubatch-size")
+PARALLEL=$(EXTRACT_ARG "--parallel")
+REUSE=$(EXTRACT_ARG "--cache-reuse")
+RAM=$(EXTRACT_ARG "--cache-ram")
+FLASH=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | grep -A 1 '^--flash-attn$' | tail -1 || echo "off")
+
+echo -e "  Batch config  : ${CYN}batch ${B_SIZE}, ubatch ${UB_SIZE}, parallel ${PARALLEL}${RST}"
+echo -e "  Cache config  : ${CYN}reuse ${REUSE}, ram ${RAM}${RST}"
+echo -e "  Flash attention: ${CYN}${FLASH}${RST}"
 
 # extract ctx-size from model args
 MODEL_CTX=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
-    grep -A1 '^--ctx-size$' | tail -1 || echo "n/a")
+    grep -A 1 '^--ctx-size$' | tail -1 || echo "n/a")
 echo -e "  Configured ctx: ${CYN}${MODEL_CTX} tokens${RST}"
-
-# (Context overflow checks now happen in section 3)
 
 # ── 2. child metrics (only if local and child port known) ─────────────────────
 header "2 / 4  Pre-request metrics"
 
 CHILD_METRICS_PRE=""
-KV_USAGE_PRE="n/a"; KV_TOKENS_PRE="n/a"
+KV_USAGE_PRE=""; KV_TOKENS_PRE=""
 
 if [[ "$IS_LOCAL" == true && -n "$CHILD_PORT" ]]; then
     CHILD_METRICS_PRE=$(curl -sf --max-time 5 "http://127.0.0.1:${CHILD_PORT}/metrics" 2>/dev/null || echo "")
     if [[ -n "$CHILD_METRICS_PRE" ]]; then
-        # Use flexible grep to handle both ':' and '_' delimiters
+        # Use standardized grep -m 1 -E for compatibility
         KV_USAGE_PRE=$(echo "$CHILD_METRICS_PRE" | grep -m 1 -E 'llamacpp[:_]kv_cache_usage_ratio' | awk '{print $NF}' || echo "")
         KV_TOKENS_PRE=$(echo "$CHILD_METRICS_PRE" | grep -m 1 -E 'llamacpp[:_]kv_cache_tokens' | awk '{print $NF}' || echo "")
         SLOTS_ACTIVE=$(echo "$CHILD_METRICS_PRE" | grep -m 1 -E 'llamacpp[:_]slots_active' | awk '{print $NF}' || echo "")
@@ -206,7 +204,7 @@ if [[ "$IS_LOCAL" == true && -n "$CHILD_PORT" ]]; then
         [[ -n "$SLOTS_ACTIVE" ]] && echo -e "  Active slots   : ${CYN}${SLOTS_ACTIVE}${RST}"
 
         if [[ -z "$KV_USAGE_PRE" && -z "$KV_TOKENS_PRE" ]]; then
-            echo -e "  ${YLW}Note: Standard KV metrics not found in server response${RST}"
+            echo -e "  ${YLW}Note: Standard KV metrics not found in child instance response${RST}"
         fi
     else
         echo -e "  ${YLW}Child metrics unavailable on port ${CHILD_PORT}${RST}"
@@ -215,7 +213,7 @@ else
     if [[ "$IS_LOCAL" == false ]]; then
         echo -e "  ${YLW}Skipping child metrics — remote server (child ports are localhost-only)${RST}"
     else
-        echo -e "  ${YLW}Model not loaded yet — no child port available${RST}"
+        echo -e "  ${YLW}Model not active — child port not assigned yet${RST}"
     fi
 fi
 
@@ -225,23 +223,21 @@ header "3 / 4  Context-fill request"
 REPEAT_UNIT="The quick brown fox jumps over the lazy dog. "
 UNIT_LEN=${#REPEAT_UNIT}
 
-# Handle safety margin relative to model's context limit
+# Handle safety margin
 SAFE_TARGET=$CTX_TARGET
 if [[ "$MODEL_CTX" != "n/a" ]] && is_positive_int "$MODEL_CTX"; then
-    # if target + overhead (estimated ~2k) exceeds context, cap it
     if (( CTX_TARGET + 1024 > MODEL_CTX )); then
         SAFE_TARGET=$(( MODEL_CTX - 1024 ))
-        echo -e "  ${YLW}⚠  Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer for overhead)${RST}"
+        echo -e "  ${YLW}⚠  Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer)${RST}"
     fi
 fi
 
-# Multiplier: 4.5 chars/token is highly accurate for this specific string and BPE
+# Multiplier: 4.5 chars/token
 CHARS_NEEDED=$(( SAFE_TARGET * 45 / 10 ))
 REPEATS=$(( CHARS_NEEDED / UNIT_LEN ))
 
 echo -e "  Filler size    : ${REPEATS} repetitions (~${CHARS_NEEDED} chars)"
 
-# Build payload in python3 → temp file to avoid shell arg length limits
 PAYLOAD_FILE=$(mktemp /tmp/llama-ctx-bench-XXXXXX.json)
 trap 'rm -f "$PAYLOAD_FILE"' EXIT
 
@@ -259,11 +255,8 @@ with open('$PAYLOAD_FILE', 'w') as fh:
 "
 
 echo -e "  Sending request (timeout: ${REQUEST_TIMEOUT}s)..."
-echo -e "  ${YLW}Note: if model was unloaded, add ~30-60s for load time${RST}"
-
 START_TS=$(now_ms)
 
-# Use -w to get HTTP status code separately, don't use -f so we see error bodies
 HTTP_RESPONSE=$(curl -s -w "\n__HTTP_STATUS__%{http_code}" \
     --max-time "$REQUEST_TIMEOUT" \
     -X POST "${BASE_URL}/v1/chat/completions" \
@@ -273,7 +266,6 @@ HTTP_RESPONSE=$(curl -s -w "\n__HTTP_STATUS__%{http_code}" \
 END_TS=$(now_ms)
 WALL_MS=$(( END_TS - START_TS ))
 
-# split body and status code
 HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep '__HTTP_STATUS__' | sed 's/__HTTP_STATUS__//')
 RESPONSE=$(echo "$HTTP_RESPONSE" | grep -v '__HTTP_STATUS__')
 
@@ -283,93 +275,66 @@ header "4 / 4  Results"
 if [[ "$HTTP_STATUS" != "200" ]]; then
     echo -e "  ${RED}Request failed — HTTP ${HTTP_STATUS}${RST}"
     echo -e "  Server response: $(echo "$RESPONSE" | jq -r '.error.message? // .' 2>/dev/null | head -3)"
-    echo ""
-    echo -e "  Wall clock: ${CYN}$(fmt_ms $WALL_MS)${RST}"
     exit 1
 fi
 
-# token counts
 PROMPT_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.prompt_tokens // 0')
-COMPL_TOKENS=$(echo  "$RESPONSE" | jq -r '.usage.completion_tokens // 0')
-TOTAL_TOKENS=$(echo  "$RESPONSE" | jq -r '.usage.total_tokens // 0')
 CACHED_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.prompt_tokens_details.cached_tokens // 0')
 FRESH_TOKENS=$(awk "BEGIN {printf \"%.0f\", $PROMPT_TOKENS - $CACHED_TOKENS}")
+COMPL_TOKENS=$(echo  "$RESPONSE" | jq -r '.usage.completion_tokens // 0')
 
-# timings from response body
 TIMINGS=$(echo "$RESPONSE" | jq '.timings? // {}')
 T_PROMPT_MS=$(echo "$TIMINGS" | jq -r '.prompt_ms // 0')
 T_PREDICT_MS=$(echo "$TIMINGS"| jq -r '.predict_ms // 0')
 PROMPT_TPS=$(echo "$TIMINGS"  | jq -r '.prompt_per_second // 0')
 PREDICT_TPS=$(echo "$TIMINGS" | jq -r '.predicted_per_second // 0')
 
-echo ""
 echo -e "  ${BLD}── Token counts ──────────────────────────────${RST}"
 echo -e "  Prompt tokens   : ${CYN}${PROMPT_TOKENS}${RST}"
 CACHE_NOTE=$(awk "BEGIN {print ($CACHED_TOKENS > 0) ? \"(cache hit — cold result needs a fresh run)\" : \"(cold run)\"}")
 echo -e "  Cached tokens   : ${CYN}${CACHED_TOKENS}${RST}  ${CACHE_NOTE}"
 echo -e "  Fresh processed : ${CYN}${FRESH_TOKENS}${RST}"
 echo -e "  Generated tokens: ${CYN}${COMPL_TOKENS}${RST}"
-echo -e "  Total tokens    : ${CYN}${TOTAL_TOKENS}${RST}"
 
-echo ""
-echo -e "  ${BLD}── Timings ───────────────────────────────────${RST}"
+echo -e "\n  ${BLD}── Timings ───────────────────────────────────${RST}"
 echo -e "  Wall clock total: ${CYN}$(fmt_ms $WALL_MS)${RST}"
 if [[ "$T_PROMPT_MS" != "0" ]]; then
     echo -e "  Prefill time    : ${CYN}$(fmt_ms $(echo "$T_PROMPT_MS" | awk '{printf "%.2f", $1}'))${RST}"
     echo -e "  Generate time   : ${CYN}$(fmt_ms $(echo "$T_PREDICT_MS" | awk '{printf "%.2f", $1}'))${RST}"
     echo -e "  Prefill speed   : ${CYN}$(printf '%.1f' $PROMPT_TPS) t/s${RST}"
     echo -e "  Generate speed  : ${CYN}$(printf '%.1f' $PREDICT_TPS) t/s${RST}"
-else
-    echo -e "  (server did not return per-request timings)"
 fi
 
-# post-request child metrics (local only)
 if [[ "$IS_LOCAL" == true ]]; then
-    # re-query models to get child port if model just loaded
-    if [[ -z "$CHILD_PORT" ]]; then
-        MODELS_JSON2=$(curl -sf --max-time 10 "${BASE_URL}/v1/models" 2>/dev/null || echo '{}')
-        CHILD_PORT=$(echo "$MODELS_JSON2" | jq -r --arg m "$MODEL" \
-            '.data[]? | select(.id == $m) | .status.args[]?' 2>/dev/null | \
-            grep -A1 '^--port$' | tail -1 || echo "0")
-        [[ "$CHILD_PORT" == "0" ]] && CHILD_PORT=""
-    fi
+    # Refresh child port for metrics
+    MODELS_JSON2=$(curl -sf --max-time 10 "${BASE_URL}/models" 2>/dev/null || echo '{"data":[]}')
+    NEW_PORT=$(echo "$MODELS_JSON2" | jq -r --arg m "$MODEL" '.data[]? | select(.id == $m) | .status.args[]?' 2>/dev/null | grep -A 1 '^--port$' | tail -1 || echo "0")
+    [[ "$NEW_PORT" == "0" ]] && NEW_PORT="$CHILD_PORT"
+    
+    if [[ -n "$NEW_PORT" ]]; then
+        CHILD_METRICS_POST=$(curl -sf --max-time 5 "http://127.0.0.1:${NEW_PORT}/metrics" 2>/dev/null || echo "")
+        KV_TOKENS_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_tokens' | awk '{print $NF}' || echo "")
+        KV_USAGE_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_usage_ratio' | awk '{print $NF}' || echo "")
 
-    if [[ -n "$CHILD_PORT" ]]; then
-        CHILD_METRICS_POST=$(curl -sf --max-time 5 "http://127.0.0.1:${CHILD_PORT}/metrics" 2>/dev/null || echo "")
-        if [[ -n "$CHILD_METRICS_POST" ]]; then
-            KV_USAGE_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_usage_ratio' | awk '{print $NF}' || echo "")
-            KV_TOKENS_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_tokens' | awk '{print $NF}' || echo "")
-
-            if [[ -n "$KV_TOKENS_POST" ]]; then
-                echo ""
-                echo -e "  ${BLD}── KV cache (post-request) ───────────────────${RST}"
-                echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST}${RST}"
-
-                if [[ -n "$KV_TOKENS_PRE" && "$KV_TOKENS_PRE" != "n/a" ]]; then
-                    KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
-                    echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
-                fi
-
-                if [[ -n "$KV_USAGE_POST" ]]; then
-                    KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
-                    if awk "BEGIN {exit !($KV_USAGE_POST > 0.95)}"; then
-                        echo -e "\n  ${RED}⚠  KV cache at ${KV_PCT}% — near capacity${RST}"
-                    elif awk "BEGIN {exit !($KV_USAGE_POST > 0.80)}"; then
-                        echo -e "\n  ${YLW}⚠  KV cache at ${KV_PCT}% — getting full${RST}"
-                    else
-                        echo -e "\n  ${GRN}✓  KV cache at ${KV_PCT}% — healthy${RST}"
-                    fi
-                fi
+        if [[ -n "$KV_TOKENS_POST" ]]; then
+            echo -e "\n  ${BLD}── KV cache (post-request) ───────────────────${RST}"
+            echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST}${RST}"
+            if [[ -n "$KV_TOKENS_PRE" ]]; then
+                KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
+                echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
+            fi
+            if [[ -n "$KV_USAGE_POST" ]]; then
+                KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
+                echo -e "  KV usage       : ${CYN}${KV_PCT}%${RST}"
             fi
         fi
     fi
 else
-    echo ""
-    echo -e "  ${YLW}Note: KV cache metrics unavailable for remote servers.${RST}"
-    echo -e "  ${YLW}Run nvidia-smi on the server host for VRAM details.${RST}"
+    echo -e "\n  ${YLW}Note: KV cache metrics unavailable for remote servers.${RST}"
+    echo -e "  Run nvidia-smi on the server host for VRAM details.${RST}"
 fi
 
-echo ""
+echo -e "\n"
 separator
 echo -e "  ${BLD}Done.${RST} $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
