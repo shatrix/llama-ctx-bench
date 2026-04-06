@@ -50,9 +50,9 @@ Test against a remote router with 64k context:
 The script performs a 4-step test:
 
 1.  **Status Check**: Verifies the server/router is alive and fetches model status via `/v1/models`. It identifies the model's child process port and startup configuration (batch size, flash attention, etc.).
-2.  **Pre-request Metrics**: Captures KV cache state from the child instance's `/metrics` endpoint.
+2.  **Pre-request Metrics**: Captures available metrics from the child instance's `/metrics` endpoint (e.g., n_tokens_max).
 3.  **Context-fill Request**: Sends a large prompt scaled to exactly fill the target token count.
-4.  **Results**: Reports token counts, high-precision timings, and post-request KV cache delta.
+4.  **Results**: Reports token counts, high-precision timings, and available server metrics.
 
 ### The Request
 
@@ -77,12 +77,16 @@ The script generates a repetitive text prompt ("The quick brown fox...") scaled 
 - **Wall clock total**: End-to-end request time including network latency.
 - **Prefill time**: Time spent processing the input prompt (with sub-millisecond precision).
 - **Prefill speed**: Tokens per second for the prefill phase (calculated server-side).
+- **Generate time**: Time spent generating output tokens.
+- **Generate speed**: Tokens per second for the generation phase.
 
 ### Server Metrics
 Metrics are sourced from the child process's `/metrics` endpoint:
-- **KV cache usage**: Ratio of KV cache currently in use (0.0 to 1.0).
-- **KV cache tokens**: Absolute number of tokens held in KV cache.
-- **KV delta**: The number of tokens added to the cache during this specific run.
+- **n_tokens_max**: High watermark of observed context size.
+- **prompt_tokens_total**: Cumulative prompt tokens processed.
+- **tokens_predicted_total**: Cumulative generation tokens processed.
+
+Note: KV cache usage metrics (`llamacpp:kv_cache_*`) are documented in llama.cpp but not implemented in current server builds. A warning will be shown if these metrics are unavailable.
 
 ## Limitations
 
@@ -107,7 +111,7 @@ sequenceDiagram
 
     Note over Client,Child: Metrics only if running on Localhost
     Client->>Child: GET /metrics (Pre-run)
-    Child-->>Client: Current KV cache state
+    Child-->>Client: n_tokens_max, token counters
 
     Client->>Router: POST /v1/chat/completions
     Router->>Child: Proxying request
@@ -115,7 +119,7 @@ sequenceDiagram
     Router-->>Client: Token usage + Server timings
 
     Client->>Child: GET /metrics (Post-run)
-    Child-->>Client: Final KV cache state
+    Child-->>Client: Updated metrics
 ```
 
 ## Exit Codes
