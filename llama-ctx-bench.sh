@@ -285,7 +285,7 @@ COMPL_TOKENS=$(echo  "$RESPONSE" | jq -r '.usage.completion_tokens // 0')
 
 TIMINGS=$(echo "$RESPONSE" | jq '.timings? // {}')
 T_PROMPT_MS=$(echo "$TIMINGS" | jq -r '.prompt_ms // 0')
-T_PREDICT_MS=$(echo "$TIMINGS"| jq -r '.predict_ms // 0')
+T_PREDICT_MS=$(echo "$TIMINGS"| jq -r '.predicted_ms // 0')
 PROMPT_TPS=$(echo "$TIMINGS"  | jq -r '.prompt_per_second // 0')
 PREDICT_TPS=$(echo "$TIMINGS" | jq -r '.predicted_per_second // 0')
 
