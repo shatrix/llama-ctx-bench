@@ -143,9 +143,11 @@ fi
 MODEL_ENTRY=$(echo "$MODELS_JSON" | jq -r --arg m "$MODEL" '.data[]? | select(.id == $m)' 2>/dev/null || echo "")
 
 if [[ -z "$MODEL_ENTRY" ]]; then
-    echo -e "  Model status  : ${YLW}not found in /v1/models — will attempt request anyway${RST}"
-    MODEL_STATUS="unknown"
-    CHILD_PORT=""
+    echo -e "  Model status  : ${RED}not found in /v1/models${RST}"
+    AVAILABLE_MODELS=$(echo "$MODELS_JSON" | jq -r '.data[].id' 2>/dev/null | sort | sed 's/^/    - /' || echo "    (none)")
+    echo -e "  Available models:\n${CYN}${AVAILABLE_MODELS}${RST}"
+    echo -e "  ${RED}Aborting.${RST}"
+    exit 1
 else
     MODEL_STATUS=$(echo "$MODEL_ENTRY" | jq -r '.status.value // "unknown"')
     CHILD_PORT=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
@@ -159,6 +161,16 @@ else
         echo -e "  Model status  : ${YLW}${MODEL_STATUS} — will load on first request (adds load time)${RST}"
     fi
     [[ -n "$CHILD_PORT" ]] && echo -e "  Child port    : ${CYN}${CHILD_PORT}${RST}"
+
+    # Extract extra config from args
+    EXTRACT_ARG() { echo "$MODEL_ENTRY" | jq -r --arg a "$1" '.status.args[]?' 2>/dev/null | grep -A1 "^$1$" | tail -1 || echo "n/a"; }
+    B_SIZE=$(EXTRACT_ARG "--batch-size")
+    UB_SIZE=$(EXTRACT_ARG "--ubatch-size")
+    PARALLEL=$(EXTRACT_ARG "--parallel")
+    FLASH=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | grep -A1 '^--flash-attn$' | tail -1 || echo "off")
+
+    echo -e "  Batch config  : ${CYN}batch ${B_SIZE}, ubatch ${UB_SIZE}, parallel ${PARALLEL}${RST}"
+    echo -e "  Flash attention: ${CYN}${FLASH}${RST}"
 fi
 
 # extract ctx-size from model args
@@ -210,8 +222,8 @@ if [[ "$MODEL_CTX" != "n/a" ]] && is_positive_int "$MODEL_CTX"; then
     fi
 fi
 
-# Multiplier: 4.0 chars/token is more accurate for this specific string than 5.0
-CHARS_NEEDED=$(( SAFE_TARGET * 4 ))
+# Multiplier: 4.5 chars/token is highly accurate for this specific string and BPE
+CHARS_NEEDED=$(( SAFE_TARGET * 45 / 10 ))
 REPEATS=$(( CHARS_NEEDED / UNIT_LEN ))
 
 echo -e "  Filler size    : ${REPEATS} repetitions (~${CHARS_NEEDED} chars)"
@@ -290,8 +302,8 @@ echo ""
 echo -e "  ${BLD}── Timings ───────────────────────────────────${RST}"
 echo -e "  Wall clock total: ${CYN}$(fmt_ms $WALL_MS)${RST}"
 if [[ "$T_PROMPT_MS" != "0" ]]; then
-    echo -e "  Prefill time    : ${CYN}$(fmt_ms $(echo "$T_PROMPT_MS" | awk '{printf "%.0f", $1}'))${RST}"
-    echo -e "  Generate time   : ${CYN}$(fmt_ms $(echo "$T_PREDICT_MS" | awk '{printf "%.0f", $1}'))${RST}"
+    echo -e "  Prefill time    : ${CYN}$(fmt_ms $(echo "$T_PROMPT_MS" | awk '{printf "%.2f", $1}'))${RST}"
+    echo -e "  Generate time   : ${CYN}$(fmt_ms $(echo "$T_PREDICT_MS" | awk '{printf "%.2f", $1}'))${RST}"
     echo -e "  Prefill speed   : ${CYN}$(printf '%.1f' $PROMPT_TPS) t/s${RST}"
     echo -e "  Generate speed  : ${CYN}$(printf '%.1f' $PREDICT_TPS) t/s${RST}"
 else
