@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# llama-ctx-bench.sh — VRAM & context load tester for llama.cpp server
+# llama-ctx-bench.sh — Context load tester for llama.cpp server
+# Connects to a remote llama.cpp server via HTTP to measure context handling.
+# NOTE: GPU/VRAM metrics are sourced from the server's /metrics endpoint (Prometheus format).
+#       For NVIDIA-specific GPU memory details, run nvidia-smi directly on the server.
+#       Multi-GPU: KV cache metrics reflect total usage across all GPUs.
 # Usage: ./llama-ctx-bench.sh -h <host> -p <port> -m <model> -c <ctx_tokens>
 # Example: ./llama-ctx-bench.sh -h 192.168.1.10 -p 8080 -m Nemotron-30B-Q4 -c 64000
 
@@ -46,7 +50,7 @@ is_positive_int() {
 
 check_deps() {
     local missing=()
-    for cmd in curl jq nvidia-smi bc; do
+    for cmd in curl jq bc python3; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -111,7 +115,7 @@ check_deps
 
 # ── banner ───────────────────────────────────────────────────────────────────
 echo -e "\n${BLD}╔══════════════════════════════════════════════╗"
-echo -e "║       llama-ctx-bench  —  VRAM load test     ║"
+echo -e "║     llama-ctx-bench  —  Context load test   ║"
 echo -e "╚══════════════════════════════════════════════╝${RST}"
 echo -e "  Server  : ${CYN}${BASE_URL}${RST}"
 echo -e "  Model   : ${CYN}${MODEL}${RST}"
@@ -135,7 +139,7 @@ header "2 / 5  Model info"
 PROPS=$(curl -sf --max-time 10 "${BASE_URL}/props" 2>/dev/null || echo '{}')
 CTX_SIZE=$(echo "$PROPS"   | jq -r '.total_slots? // "n/a"')
 N_CTX=$(echo "$PROPS"      | jq -r '.n_ctx? // "n/a"')
-CHAT_TMPL=$(echo "$PROPS"  | jq -r '.chat_template? // "n/a"' | head -c 60)
+CHAT_TMPL=$(echo "$PROPS"  | jq -r '.chat_template? // "n/a"' | cut -c1-60)
 MODEL_META=$(echo "$PROPS" | jq -r '.model_meta? // {} | to_entries[] | "  \(.key): \(.value)"' 2>/dev/null | head -20 || true)
 
 echo -e "  n_ctx         : ${CYN}${N_CTX}${RST}"
@@ -143,27 +147,25 @@ echo -e "  total_slots   : ${CYN}${CTX_SIZE}${RST}"
 echo -e "  chat_template : ${CYN}${CHAT_TMPL}...${RST}"
 [[ -n "$MODEL_META" ]] && echo -e "$MODEL_META"
 
-# ── 3. pre-request metrics & VRAM ────────────────────────────────────────────
-header "3 / 5  Baseline VRAM (before request)"
+# ── 3. pre-request server metrics ───────────────────────────────────────────
+header "3 / 5  Server metrics (pre-request)"
 
-GPU_PRE=$(nvidia-smi --query-gpu=memory.used,memory.free,memory.total,utilization.gpu,temperature.gpu \
-    --format=csv,noheader,nounits 2>/dev/null || echo "n/a,n/a,n/a,n/a,n/a")
-
-IFS=',' read -r VRAM_USED_PRE VRAM_FREE_PRE VRAM_TOTAL UTIL_PRE TEMP_PRE <<< "$GPU_PRE"
-VRAM_USED_PRE=$(echo "$VRAM_USED_PRE" | xargs)
-VRAM_FREE_PRE=$(echo "$VRAM_FREE_PRE" | xargs)
-VRAM_TOTAL=$(echo "$VRAM_TOTAL" | xargs)
-UTIL_PRE=$(echo "$UTIL_PRE" | xargs)
-TEMP_PRE=$(echo "$TEMP_PRE" | xargs)
-
-echo -e "  VRAM used     : ${CYN}${VRAM_USED_PRE} MiB${RST}"
-echo -e "  VRAM free     : ${CYN}${VRAM_FREE_PRE} MiB${RST}"
-echo -e "  VRAM total    : ${CYN}${VRAM_TOTAL} MiB${RST}"
-echo -e "  GPU util      : ${CYN}${UTIL_PRE}%${RST}"
-echo -e "  GPU temp      : ${CYN}${TEMP_PRE}°C${RST}"
-
-# grab metrics snapshot before request
 METRICS_PRE=$(curl -sf --max-time 10 "${BASE_URL}/metrics" 2>/dev/null || echo "")
+
+if [[ -n "$METRICS_PRE" ]]; then
+    KV_USAGE_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:kv_cache_usage_ratio' | awk '{print $2}' || echo "n/a")
+    KV_TOKENS_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:kv_cache_tokens' | awk '{print $2}' || echo "n/a")
+    SLOTS_ACTIVE_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:slots_active' | awk '{print $2}' || echo "n/a")
+    SLOTS_IDLE_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:slots_idle' | awk '{print $2}' || echo "n/a")
+    
+    echo -e "  KV cache usage : ${CYN}${KV_USAGE_PRE:-n/a}${RST}"
+    echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_PRE:-n/a}${RST}"
+    echo -e "  Active slots   : ${CYN}${SLOTS_ACTIVE_PRE:-n/a}${RST}"
+    echo -e "  Idle slots     : ${CYN}${SLOTS_IDLE_PRE:-n/a}${RST}"
+else
+    echo -e "  ${YLW}Warning: Could not fetch server metrics${RST}"
+    KV_USAGE_PRE="n/a"; KV_TOKENS_PRE="n/a"; SLOTS_ACTIVE_PRE="n/a"; SLOTS_IDLE_PRE="n/a"
+fi
 
 # ── 4. build prompt & fire request ──────────────────────────────────────────
 header "4 / 5  Sending context-fill request"
@@ -202,14 +204,8 @@ RESPONSE=$(curl -sf \
 END_TS=$(now_ms)
 WALL_MS=$(( END_TS - START_TS ))
 
-# VRAM peak — sampled immediately after request completes
-GPU_POST=$(nvidia-smi --query-gpu=memory.used,memory.free,utilization.gpu,temperature.gpu \
-    --format=csv,noheader,nounits 2>/dev/null || echo "n/a,n/a,n/a,n/a")
-IFS=',' read -r VRAM_USED_POST VRAM_FREE_POST UTIL_POST TEMP_POST <<< "$GPU_POST"
-VRAM_USED_POST=$(echo "$VRAM_USED_POST" | xargs)
-VRAM_FREE_POST=$(echo "$VRAM_FREE_POST" | xargs)
-UTIL_POST=$(echo "$UTIL_POST" | xargs)
-TEMP_POST=$(echo "$TEMP_POST" | xargs)
+# post-request metrics from server
+METRICS_POST=$(curl -sf --max-time 10 "${BASE_URL}/metrics" 2>/dev/null || echo "")
 
 # ── 5. results ───────────────────────────────────────────────────────────────
 header "5 / 5  Results"
@@ -236,28 +232,30 @@ T_TOTAL_MS=$(echo "$TIMINGS"      | jq -r '.total_ms // 0')
 PROMPT_TPS=$(echo "$TIMINGS"      | jq -r '.prompt_per_second // 0')
 PREDICT_TPS=$(echo "$TIMINGS"     | jq -r '.predicted_per_second // 0')
 
-# VRAM delta — use awk for float-safe arithmetic
-if [[ "$VRAM_USED_PRE" != "n/a" && "$VRAM_USED_POST" != "n/a" ]]; then
-    VRAM_DELTA=$(awk "BEGIN {printf \"%.0f\", $VRAM_USED_POST - $VRAM_USED_PRE}")
-    VRAM_DELTA_FMT="${VRAM_DELTA} MiB"
-    VRAM_HEADROOM=$(awk "BEGIN {printf \"%.0f\", $VRAM_TOTAL - $VRAM_USED_POST}")
-else
-    VRAM_DELTA_FMT="n/a"
-    VRAM_HEADROOM="n/a"
+# Server-side metrics
+KV_USAGE_POST=""
+KV_TOKENS_POST=""
+SLOTS_ACTIVE_POST=""
+SLOTS_IDLE_POST=""
+if [[ -n "$METRICS_POST" ]]; then
+    KV_USAGE_POST=$(echo "$METRICS_POST" | grep -m1 'llamacpp:kv_cache_usage_ratio' | awk '{print $2}' || echo "n/a")
+    KV_TOKENS_POST=$(echo "$METRICS_POST" | grep -m1 'llamacpp:kv_cache_tokens' | awk '{print $2}' || echo "n/a")
+    SLOTS_ACTIVE_POST=$(echo "$METRICS_POST" | grep -m1 'llamacpp:slots_active' | awk '{print $2}' || echo "n/a")
+    SLOTS_IDLE_POST=$(echo "$METRICS_POST" | grep -m1 'llamacpp:slots_idle' | awk '{print $2}' || echo "n/a")
 fi
 
-# post-request metrics
-METRICS_POST=$(curl -sf --max-time 10 "${BASE_URL}/metrics" 2>/dev/null || echo "")
-KV_USAGE=""
-if [[ -n "$METRICS_POST" ]]; then
-    KV_USAGE=$(echo "$METRICS_POST" | grep 'llamacpp:kv_cache_usage_ratio' | awk '{print $2}' | head -1 || true)
-    KV_TOKENS=$(echo "$METRICS_POST" | grep 'llamacpp:kv_cache_tokens' | awk '{print $2}' | head -1 || true)
+# KV cache delta
+KV_DELTA=""
+if [[ "$KV_TOKENS_PRE" != "n/a" && "$KV_TOKENS_POST" != "n/a" ]]; then
+    KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
+    [[ "$KV_DELTA" =~ ^- ]] && KV_DELTA="~$((-1 * KV_DELTA)) cleared"
 fi
 
 echo ""
 echo -e "  ${BLD}── Token counts ──────────────────────────────${RST}"
 echo -e "  Prompt tokens   : ${CYN}${PROMPT_TOKENS}${RST}"
-echo -e "  Cached tokens   : ${CYN}${CACHED_TOKENS}${RST}  $([ "$(awk "BEGIN {print ($CACHED_TOKENS > 0) ? 1 : 0}")" -eq 1 ] && echo "(cache hit — run again for cold result)" || echo "(cold run)")"
+CACHE_NOTE=$(awk "BEGIN {print ($CACHED_TOKENS > 0) ? \"(cache hit — run again for cold result)\" : \"(cold run)\"}")
+echo -e "  Cached tokens   : ${CYN}${CACHED_TOKENS}${RST}  ${CACHE_NOTE}"
 echo -e "  Fresh tokens    : ${CYN}${FRESH_TOKENS}${RST}"
 echo -e "  Generated tokens: ${CYN}${COMPL_TOKENS}${RST}"
 echo -e "  Total tokens    : ${CYN}${TOTAL_TOKENS}${RST}"
@@ -275,29 +273,22 @@ else
 fi
 
 echo ""
-echo -e "  ${BLD}── VRAM ──────────────────────────────────────${RST}"
-echo -e "  Before request  : ${CYN}${VRAM_USED_PRE} MiB${RST}"
-echo -e "  After request   : ${CYN}${VRAM_USED_POST} MiB${RST}"
-echo -e "  Delta (KV cost) : ${CYN}${VRAM_DELTA_FMT}${RST}"
-echo -e "  Headroom left   : ${CYN}${VRAM_HEADROOM} MiB${RST}"
-echo -e "  GPU util after  : ${CYN}${UTIL_POST}%${RST}"
-echo -e "  GPU temp after  : ${CYN}${TEMP_POST}°C${RST}"
+echo -e "  ${BLD}── Server metrics (post-request) ─────────────────${RST}"
+echo -e "  KV cache usage : ${CYN}${KV_USAGE_POST:-n/a}${RST}"
+echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST:-n/a}${RST}"
+echo -e "  Active slots   : ${CYN}${SLOTS_ACTIVE_POST:-n/a}${RST}"
+echo -e "  Idle slots     : ${CYN}${SLOTS_IDLE_POST:-n/a}${RST}"
+[[ -n "$KV_DELTA" ]] && echo -e "  KV delta       : ${CYN}${KV_DELTA}${RST}"
 
-if [[ -n "$KV_USAGE" ]]; then
-    echo ""
-    echo -e "  ${BLD}── KV cache (server metrics) ─────────────────${RST}"
-    echo -e "  KV usage ratio  : ${CYN}$(echo "$KV_USAGE * 100" | bc | awk '{printf "%.1f", $1}')%${RST}"
-    [[ -n "$KV_TOKENS" ]] && echo -e "  KV tokens used  : ${CYN}${KV_TOKENS}${RST}"
-fi
-
-# headroom warning
-if [[ "$VRAM_HEADROOM" != "n/a" ]]; then
-    if (( $(echo "$VRAM_HEADROOM < 500" | bc -l) )); then
-        echo -e "\n  ${RED}⚠  Less than 500 MiB headroom — likely hitting CPU offload at this context size${RST}"
-    elif (( $(echo "$VRAM_HEADROOM < 1500" | bc -l) )); then
-        echo -e "\n  ${YLW}⚠  Tight headroom — watch for occasional CPU offload under load${RST}"
+# KV cache usage warning
+if [[ "$KV_USAGE_POST" != "n/a" && "$KV_USAGE_POST" != "" ]]; then
+    KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
+    if awk "BEGIN {exit !($KV_USAGE_POST > 0.95)}"; then
+        echo -e "\n  ${RED}⚠  KV cache at ${KV_PCT}% — near capacity, expect cache evictions${RST}"
+    elif awk "BEGIN {exit !($KV_USAGE_POST > 0.80)}"; then
+        echo -e "\n  ${YLW}⚠  KV cache at ${KV_PCT}% — getting full${RST}"
     else
-        echo -e "\n  ${GRN}✓  Comfortable headroom at this context size${RST}"
+        echo -e "\n  ${GRN}✓  KV cache at ${KV_PCT}% — healthy${RST}"
     fi
 fi
 
