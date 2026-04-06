@@ -166,11 +166,7 @@ MODEL_CTX=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | \
     grep -A1 '^--ctx-size$' | tail -1 || echo "n/a")
 echo -e "  Configured ctx: ${CYN}${MODEL_CTX} tokens${RST}"
 
-if [[ "$MODEL_CTX" != "n/a" ]] && is_positive_int "$MODEL_CTX"; then
-    if (( CTX_TARGET > MODEL_CTX )); then
-        echo -e "  ${RED}⚠  Requested ${CTX_TARGET} tokens exceeds model ctx-size ${MODEL_CTX} — request will be truncated${RST}"
-    fi
-fi
+# (Context overflow checks now happen in section 3)
 
 # ── 2. child metrics (only if local and child port known) ─────────────────────
 header "2 / 4  Pre-request metrics"
@@ -203,8 +199,20 @@ header "3 / 4  Context-fill request"
 
 REPEAT_UNIT="The quick brown fox jumps over the lazy dog. "
 UNIT_LEN=${#REPEAT_UNIT}
-CHARS_NEEDED=$(( CTX_TARGET * 5 ))
-REPEATS=$(( CHARS_NEEDED / UNIT_LEN + 1 ))
+
+# Handle safety margin relative to model's context limit
+SAFE_TARGET=$CTX_TARGET
+if [[ "$MODEL_CTX" != "n/a" ]] && is_positive_int "$MODEL_CTX"; then
+    # if target + overhead (estimated ~2k) exceeds context, cap it
+    if (( CTX_TARGET + 1024 > MODEL_CTX )); then
+        SAFE_TARGET=$(( MODEL_CTX - 1024 ))
+        echo -e "  ${YLW}⚠  Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer for overhead)${RST}"
+    fi
+fi
+
+# Multiplier: 4.0 chars/token is more accurate for this specific string than 5.0
+CHARS_NEEDED=$(( SAFE_TARGET * 4 ))
+REPEATS=$(( CHARS_NEEDED / UNIT_LEN ))
 
 echo -e "  Filler size    : ${REPEATS} repetitions (~${CHARS_NEEDED} chars)"
 
