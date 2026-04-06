@@ -124,9 +124,13 @@ header "1 / 4  Router health & model status"
 
 MODELS_JSON=$(curl -sf --max-time 10 "${BASE_URL}/v1/models" 2>/dev/null || echo '{}')
 
-# check router is alive
-ROUTER_ROLE=$(echo "$MODELS_JSON" | jq -r '.role? // "unknown"' 2>/dev/null || echo "unknown")
-if [[ "$ROUTER_ROLE" == "router" ]]; then
+# Identify router by JSON structure (top-level role:router or presence of model args)
+IS_ROUTER=false
+if echo "$MODELS_JSON" | jq -e '.role == "router" or (.data? | type == "array" and any(.data[]; .status.args? != null))' >/dev/null 2>&1; then
+    IS_ROUTER=true
+fi
+
+if [[ "$IS_ROUTER" == true ]]; then
     echo -e "  Router status : ${GRN}ok (router mode)${RST}"
 else
     # might be a direct server, check /health
@@ -155,8 +159,8 @@ else
     # port 0 means unloaded/not assigned
     [[ "$CHILD_PORT" == "0" ]] && CHILD_PORT=""
 
-    if [[ "$MODEL_STATUS" == "loaded" ]]; then
-        echo -e "  Model status  : ${GRN}loaded${RST}"
+    if [[ "$MODEL_STATUS" == "loaded" || "$MODEL_STATUS" == "sleeping" ]]; then
+        echo -e "  Model status  : ${GRN}${MODEL_STATUS}${RST}"
     else
         echo -e "  Model status  : ${YLW}${MODEL_STATUS} — will load on first request (adds load time)${RST}"
     fi
@@ -170,6 +174,9 @@ else
     FLASH=$(echo "$MODEL_ENTRY" | jq -r '.status.args[]?' 2>/dev/null | grep -A1 '^--flash-attn$' | tail -1 || echo "off")
 
     echo -e "  Batch config  : ${CYN}batch ${B_SIZE}, ubatch ${UB_SIZE}, parallel ${PARALLEL}${RST}"
+    REUSE=$(EXTRACT_ARG "--cache-reuse")
+    RAM=$(EXTRACT_ARG "--cache-ram")
+    echo -e "  Cache config  : ${CYN}reuse ${REUSE}, ram ${RAM}${RST}"
     echo -e "  Flash attention: ${CYN}${FLASH}${RST}"
 fi
 
@@ -189,12 +196,18 @@ KV_USAGE_PRE="n/a"; KV_TOKENS_PRE="n/a"
 if [[ "$IS_LOCAL" == true && -n "$CHILD_PORT" ]]; then
     CHILD_METRICS_PRE=$(curl -sf --max-time 5 "http://127.0.0.1:${CHILD_PORT}/metrics" 2>/dev/null || echo "")
     if [[ -n "$CHILD_METRICS_PRE" ]]; then
-        KV_USAGE_PRE=$(echo "$CHILD_METRICS_PRE" | grep -m1 'llamacpp:kv_cache_usage_ratio' | awk '{print $2}' || echo "n/a")
-        KV_TOKENS_PRE=$(echo "$CHILD_METRICS_PRE" | grep -m1 'llamacpp:kv_cache_tokens' | awk '{print $2}' || echo "n/a")
-        SLOTS_ACTIVE=$(echo "$CHILD_METRICS_PRE" | grep -m1 'llamacpp:slots_active' | awk '{print $2}' || echo "n/a")
-        echo -e "  KV cache usage : ${CYN}${KV_USAGE_PRE}${RST}"
-        echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_PRE}${RST}"
-        echo -e "  Active slots   : ${CYN}${SLOTS_ACTIVE}${RST}"
+        # Use flexible grep to handle both ':' and '_' delimiters
+        KV_USAGE_PRE=$(echo "$CHILD_METRICS_PRE" | grep -m 1 -E 'llamacpp[:_]kv_cache_usage_ratio' | awk '{print $NF}' || echo "")
+        KV_TOKENS_PRE=$(echo "$CHILD_METRICS_PRE" | grep -m 1 -E 'llamacpp[:_]kv_cache_tokens' | awk '{print $NF}' || echo "")
+        SLOTS_ACTIVE=$(echo "$CHILD_METRICS_PRE" | grep -m 1 -E 'llamacpp[:_]slots_active' | awk '{print $NF}' || echo "")
+
+        [[ -n "$KV_USAGE_PRE" ]] && echo -e "  KV cache usage : ${CYN}${KV_USAGE_PRE}${RST}"
+        [[ -n "$KV_TOKENS_PRE" ]] && echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_PRE}${RST}"
+        [[ -n "$SLOTS_ACTIVE" ]] && echo -e "  Active slots   : ${CYN}${SLOTS_ACTIVE}${RST}"
+
+        if [[ -z "$KV_USAGE_PRE" && -z "$KV_TOKENS_PRE" ]]; then
+            echo -e "  ${YLW}Note: Standard KV metrics not found in server response${RST}"
+        fi
     else
         echo -e "  ${YLW}Child metrics unavailable on port ${CHILD_PORT}${RST}"
     fi
@@ -324,26 +337,28 @@ if [[ "$IS_LOCAL" == true ]]; then
     if [[ -n "$CHILD_PORT" ]]; then
         CHILD_METRICS_POST=$(curl -sf --max-time 5 "http://127.0.0.1:${CHILD_PORT}/metrics" 2>/dev/null || echo "")
         if [[ -n "$CHILD_METRICS_POST" ]]; then
-            KV_USAGE_POST=$(echo "$CHILD_METRICS_POST" | grep -m1 'llamacpp:kv_cache_usage_ratio' | awk '{print $2}' || echo "n/a")
-            KV_TOKENS_POST=$(echo "$CHILD_METRICS_POST" | grep -m1 'llamacpp:kv_cache_tokens' | awk '{print $2}' || echo "n/a")
+            KV_USAGE_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_usage_ratio' | awk '{print $NF}' || echo "")
+            KV_TOKENS_POST=$(echo "$CHILD_METRICS_POST" | grep -m 1 -E 'llamacpp[:_]kv_cache_tokens' | awk '{print $NF}' || echo "")
 
-            echo ""
-            echo -e "  ${BLD}── KV cache (post-request) ───────────────────${RST}"
-            echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST}${RST}"
+            if [[ -n "$KV_TOKENS_POST" ]]; then
+                echo ""
+                echo -e "  ${BLD}── KV cache (post-request) ───────────────────${RST}"
+                echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST}${RST}"
 
-            if [[ "$KV_TOKENS_PRE" != "n/a" && "$KV_TOKENS_POST" != "n/a" ]]; then
-                KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
-                echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
-            fi
+                if [[ -n "$KV_TOKENS_PRE" && "$KV_TOKENS_PRE" != "n/a" ]]; then
+                    KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
+                    echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
+                fi
 
-            if [[ "$KV_USAGE_POST" != "n/a" && "$KV_USAGE_POST" != "" ]]; then
-                KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
-                if awk "BEGIN {exit !($KV_USAGE_POST > 0.95)}"; then
-                    echo -e "\n  ${RED}⚠  KV cache at ${KV_PCT}% — near capacity${RST}"
-                elif awk "BEGIN {exit !($KV_USAGE_POST > 0.80)}"; then
-                    echo -e "\n  ${YLW}⚠  KV cache at ${KV_PCT}% — getting full${RST}"
-                else
-                    echo -e "\n  ${GRN}✓  KV cache at ${KV_PCT}% — healthy${RST}"
+                if [[ -n "$KV_USAGE_POST" ]]; then
+                    KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
+                    if awk "BEGIN {exit !($KV_USAGE_POST > 0.95)}"; then
+                        echo -e "\n  ${RED}⚠  KV cache at ${KV_PCT}% — near capacity${RST}"
+                    elif awk "BEGIN {exit !($KV_USAGE_POST > 0.80)}"; then
+                        echo -e "\n  ${YLW}⚠  KV cache at ${KV_PCT}% — getting full${RST}"
+                    else
+                        echo -e "\n  ${GRN}✓  KV cache at ${KV_PCT}% — healthy${RST}"
+                    fi
                 fi
             fi
         fi
