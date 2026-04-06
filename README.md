@@ -31,6 +31,7 @@ The script runs from any machine. It connects to a `llama.cpp` server over HTTP.
 | `-p PORT` | Server/Router port | 8080 |
 | `-c TOKENS` | Target context size in tokens | 32000 |
 | `-t TIMEOUT` | Request timeout in seconds | 600 |
+| `-r RATIO` | Character-to-token ratio for prompt generation | 4.5 |
 | `--help` | Show usage help | - |
 
 ### Examples
@@ -65,6 +66,7 @@ The script generates a repetitive text prompt ("The quick brown fox...") scaled 
 
 ### Configuration & Context
 - **Batch config**: Shows the server's `--batch-size`, `--ubatch-size`, and `--parallel` settings.
+- **Cache config**: Shows `--cache-reuse` and `--cache-ram` settings.
 - **Flash attention**: Indicates if Flash Attention is enabled on the server.
 - **Configured ctx**: The maximum context size allowed by the model startup arguments.
 

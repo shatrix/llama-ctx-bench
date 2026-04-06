@@ -16,6 +16,7 @@ MODEL=""
 CTX_TARGET=32000
 MAX_GEN_TOKENS=10
 REQUEST_TIMEOUT=600
+CHAR_TO_TOKEN_RATIO=4.5
 
 # ── colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
@@ -35,6 +36,7 @@ Options:
   -p PORT       Router port (default: 8080)
   -c TOKENS     Target context tokens to fill (default: 32000)
   -t TIMEOUT    Request timeout seconds (default: 600)
+  -r RATIO      Character-to-token ratio (default: 4.5)
   --help        Show this help
 
 Notes:
@@ -97,6 +99,9 @@ while [[ $# -gt 0 ]]; do
         -t) [[ $# -lt 2 ]] && { echo -e "${RED}Error: -t requires a value${RST}"; usage 1; }
             is_positive_int "$2" || { echo -e "${RED}Error: -t must be a positive integer${RST}"; usage 1; }
             REQUEST_TIMEOUT="$2"; shift 2 ;;
+        -r) [[ $# -lt 2 ]] && { echo -e "${RED}Error: -r requires a value${RST}"; usage 1; }
+            [[ "$2" =~ ^[0-9]+\.?[0-9]*$ ]] || { echo -e "${RED}Error: -r must be a positive number${RST}"; usage 1; }
+            CHAR_TO_TOKEN_RATIO="$2"; shift 2 ;;
         --help) usage ;;
         *) echo -e "${RED}Unknown option: $1${RST}"; usage 1 ;;
     esac
@@ -106,7 +111,7 @@ done
 
 BASE_URL="http://${HOST}:${PORT}"
 IS_LOCAL=false
-[[ "$HOST" == "localhost" || "$HOST" == "127.0.0.1" ]] && IS_LOCAL=true
+[[ "$HOST" == "localhost" || "$HOST" == "127.0.0.1" || "$HOST" == "::1" ]] && IS_LOCAL=true
 
 check_deps
 
@@ -188,7 +193,7 @@ PARALLEL=$(EXTRACT_ARG "--parallel")
 REUSE=$(EXTRACT_ARG "--cache-reuse")
 RAM=$(EXTRACT_ARG "--cache-ram")
 FLASH=$(EXTRACT_ARG "--flash-attn")
-[[ -z "$FLASH" ]] && FLASH="off"
+[[ -z "$FLASH" || "$FLASH" == "n/a" ]] && FLASH="off"
 
 echo -e "  Batch config  : ${CYN}batch ${B_SIZE}, ubatch ${UB_SIZE}, parallel ${PARALLEL}${RST}"
 echo -e "  Cache config  : ${CYN}reuse ${REUSE}, ram ${RAM}${RST}"
@@ -197,6 +202,13 @@ echo -e "  Flash attention: ${CYN}${FLASH}${RST}"
 # extract ctx-size from model args
 MODEL_CTX=$(EXTRACT_ARG "--ctx-size")
 echo -e "  Configured ctx: ${CYN}${MODEL_CTX} tokens${RST}"
+
+# early validation
+if [[ "$MODEL_CTX" =~ ^[0-9]+$ ]] && (( CTX_TARGET > MODEL_CTX )); then
+    echo -e "\n  ${RED}Error: Target context (${CTX_TARGET}) exceeds model max (${MODEL_CTX})${RST}"
+    echo -e "  Either reduce -c value or increase model --ctx-size"
+    exit 1
+fi
 
 # ── 2. child metrics (only if local and child port known) ─────────────────────
 header "2 / 4  Pre-request metrics"
@@ -243,11 +255,12 @@ if [[ "$MODEL_CTX" =~ ^[0-9]+$ ]] && (( CTX_TARGET + 1024 > MODEL_CTX )); then
     echo -e "  ${YLW}[WARN] Capping filler to ${SAFE_TARGET} tokens (leaving 1k buffer)${RST}"
 fi
 
-# Multiplier: 4.5 chars/token (use Python for safe large-number arithmetic)
-CHARS_NEEDED=$(python3 -c "print(int($SAFE_TARGET * 4.5))")
+# Multiplier: chars per token (use Python for safe large-number arithmetic)
+CHARS_NEEDED=$(python3 -c "print(int($SAFE_TARGET * $CHAR_TO_TOKEN_RATIO))")
 REPEATS=$(( CHARS_NEEDED / UNIT_LEN ))
 
 echo -e "  Filler size    : ${REPEATS} repetitions (~${CHARS_NEEDED} chars)"
+echo -e "  Using ratio    : ${CHAR_TO_TOKEN_RATIO} chars/token"
 
 PAYLOAD_FILE=$(mktemp /tmp/llama-ctx-bench-XXXXXX.json)
 chmod 600 "$PAYLOAD_FILE"
@@ -266,17 +279,28 @@ with open('$PAYLOAD_FILE', 'w') as fh:
     json.dump(payload, fh)
 "
 
-echo -e "  Sending request (timeout: ${REQUEST_TIMEOUT}s)..."
+echo -ne "  Sending request (timeout: ${REQUEST_TIMEOUT}s)"
 START_TS=$(now_ms)
 
 RESPONSE_FILE=$(mktemp)
-HTTP_STATUS=$(curl -s -w "%{http_code}" -o "$RESPONSE_FILE" \
+STATUS_FILE=$(mktemp)
+# run curl in background for progress indicator
+(curl -s -w "%{http_code}" -o "$RESPONSE_FILE" \
     --max-time "$REQUEST_TIMEOUT" \
     -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d "@${PAYLOAD_FILE}" 2>/dev/null)
+    -d "@${PAYLOAD_FILE}" > "$STATUS_FILE" 2>/dev/null) &
+CURL_PID=$!
+
+# progress indicator (use stderr for unbuffered output)
+while kill -0 $CURL_PID 2>/dev/null; do
+    sleep 10
+    kill -0 $CURL_PID 2>/dev/null && printf "." >&2
+done
+wait $CURL_PID
+HTTP_STATUS=$(cat "$STATUS_FILE")
 RESPONSE=$(cat "$RESPONSE_FILE")
-rm -f "$RESPONSE_FILE"
+rm -f "$RESPONSE_FILE" "$STATUS_FILE"
 
 [[ -z "$HTTP_STATUS" || "$HTTP_STATUS" == "000" ]] && HTTP_STATUS="000"
 
@@ -306,8 +330,11 @@ PREDICT_TPS=$(echo "$TIMINGS" | jq -r '.predicted_per_second // 0')
 
 echo -e "  ${BLD}── Token counts ──────────────────────────────${RST}"
 echo -e "  Prompt tokens   : ${CYN}${PROMPT_TOKENS}${RST}"
-CACHE_NOTE=$(awk "BEGIN {print ($CACHED_TOKENS > 0) ? \"(cache hit — cold result needs a fresh run)\" : \"(cold run)\"}")
-echo -e "  Cached tokens   : ${CYN}${CACHED_TOKENS}${RST}  ${CACHE_NOTE}"
+if [[ "$CACHED_TOKENS" -gt 0 ]]; then
+    echo -e "  Cached tokens   : ${CYN}${CACHED_TOKENS}${RST}  (cache hit)"
+else
+    echo -e "  Cached tokens   : ${CYN}0${RST}  (cold run)"
+fi
 echo -e "  Fresh processed : ${CYN}${FRESH_TOKENS}${RST}"
 echo -e "  Generated tokens: ${CYN}${COMPL_TOKENS}${RST}"
 
@@ -341,11 +368,15 @@ if [[ "$IS_LOCAL" == true ]]; then
             echo -e "\n  ${BLD}── KV cache (post-request) ───────────────────${RST}"
             echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_POST}${RST}"
             if [[ -n "$KV_TOKENS_PRE" && "$KV_TOKENS_PRE" =~ ^[0-9.]+$ ]]; then
-                KV_DELTA=$(awk "BEGIN {printf \"%.0f\", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
-                echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
+                KV_DELTA=$(awk "BEGIN {printf "%.0f", $KV_TOKENS_POST - $KV_TOKENS_PRE}")
+                if [[ "$KV_DELTA" -ge 0 ]]; then
+                    echo -e "  KV delta       : ${CYN}${KV_DELTA} tokens added${RST}"
+                else
+                    echo -e "  KV delta       : ${CYN}${KV_DELTA}${RST} (cache cleared)"
+                fi
             fi
             if [[ -n "$KV_USAGE_POST" && "$KV_USAGE_POST" =~ ^[0-9.]+$ ]]; then
-                KV_PCT=$(awk "BEGIN {printf \"%.1f\", $KV_USAGE_POST * 100}")
+                KV_PCT=$(awk "BEGIN {printf "%.1f", $KV_USAGE_POST * 100}")
                 echo -e "  KV usage       : ${CYN}${KV_PCT}%${RST}"
             fi
         fi
@@ -355,7 +386,5 @@ else
     echo -e "  Run nvidia-smi on the server host for VRAM details.${RST}"
 fi
 
-echo -e "\n"
 separator
-echo -e "  ${BLD}Done.${RST} $(date '+%Y-%m-%d %H:%M:%S')"
-echo ""
+echo -e "  ${BLD}Done.${RST} Total: $(fmt_ms $WALL_MS) | $(date '+%Y-%m-%d %H:%M:%S')"
