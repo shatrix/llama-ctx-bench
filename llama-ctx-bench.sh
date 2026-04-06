@@ -115,7 +115,7 @@ check_deps
 
 # ── banner ───────────────────────────────────────────────────────────────────
 echo -e "\n${BLD}╔══════════════════════════════════════════════╗"
-echo -e "║     llama-ctx-bench  —  Context load test   ║"
+echo -e "║     llama-ctx-bench  —  Context load test    ║"
 echo -e "╚══════════════════════════════════════════════╝${RST}"
 echo -e "  Server  : ${CYN}${BASE_URL}${RST}"
 echo -e "  Model   : ${CYN}${MODEL}${RST}"
@@ -157,7 +157,7 @@ if [[ -n "$METRICS_PRE" ]]; then
     KV_TOKENS_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:kv_cache_tokens' | awk '{print $2}' || echo "n/a")
     SLOTS_ACTIVE_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:slots_active' | awk '{print $2}' || echo "n/a")
     SLOTS_IDLE_PRE=$(echo "$METRICS_PRE" | grep -m1 'llamacpp:slots_idle' | awk '{print $2}' || echo "n/a")
-    
+
     echo -e "  KV cache usage : ${CYN}${KV_USAGE_PRE:-n/a}${RST}"
     echo -e "  KV cache tokens: ${CYN}${KV_TOKENS_PRE:-n/a}${RST}"
     echo -e "  Active slots   : ${CYN}${SLOTS_ACTIVE_PRE:-n/a}${RST}"
@@ -171,26 +171,33 @@ fi
 header "4 / 5  Sending context-fill request"
 
 # tokens/chars ratio: "The quick brown fox jumps over the lazy dog. " = 45 chars ~ 10 tokens
-# so chars_needed = ctx_target * 4.5  (conservative — better to overshoot slightly)
+# so chars_needed = ctx_target * 5 (conservative — better to overshoot slightly)
 CHARS_NEEDED=$(( CTX_TARGET * 5 ))
 REPEAT_UNIT="The quick brown fox jumps over the lazy dog. "
 UNIT_LEN=${#REPEAT_UNIT}
 REPEATS=$(( CHARS_NEEDED / UNIT_LEN + 1 ))
 
 echo -e "  Generating filler : ${REPEATS} repetitions (~${CHARS_NEEDED} chars)"
-FILLER=$(python3 -c "import sys; print(sys.argv[1] * int(sys.argv[2]))" "$REPEAT_UNIT" "$REPEATS")
 
-PAYLOAD=$(jq -n \
-    --arg m "$MODEL" \
-    --arg p "$FILLER" \
-    --argjson maxt "$MAX_GEN_TOKENS" \
-    '{
-        model: $m,
-        messages: [{role: "user", content: $p}],
-        max_tokens: $maxt,
-        temperature: 0,
-        stream: false
-    }')
+# Build the JSON payload entirely in python3 and write it to a temp file.
+# This avoids the OS "Argument list too long" error that occurs when passing
+# large strings (300k+ chars) as shell arguments to jq or curl -d.
+PAYLOAD_FILE=$(mktemp /tmp/llama-ctx-bench-XXXXXX.json)
+trap 'rm -f "$PAYLOAD_FILE"' EXIT
+
+python3 -c "
+import json
+unit    = 'The quick brown fox jumps over the lazy dog. '
+payload = {
+    'model':    '$MODEL',
+    'messages': [{'role': 'user', 'content': unit * $REPEATS}],
+    'max_tokens': $MAX_GEN_TOKENS,
+    'temperature': 0,
+    'stream': False
+}
+with open('$PAYLOAD_FILE', 'w') as fh:
+    json.dump(payload, fh)
+"
 
 echo -e "  Firing request... (timeout: ${REQUEST_TIMEOUT}s)"
 START_TS=$(now_ms)
@@ -199,7 +206,7 @@ RESPONSE=$(curl -sf \
     --max-time "$REQUEST_TIMEOUT" \
     -X POST "${BASE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d "$PAYLOAD" 2>/dev/null || echo '{"error":"request_failed"}')
+    -d "@${PAYLOAD_FILE}" 2>/dev/null || echo '{"error":"request_failed"}')
 
 END_TS=$(now_ms)
 WALL_MS=$(( END_TS - START_TS ))
@@ -226,11 +233,11 @@ FRESH_TOKENS=$(awk "BEGIN {printf \"%.0f\", $PROMPT_TOKENS - $CACHED_TOKENS}")
 
 # timings (from response if available)
 TIMINGS=$(echo "$RESPONSE" | jq '.timings? // {}')
-T_PROMPT_MS=$(echo "$TIMINGS"     | jq -r '.prompt_ms // 0')
-T_PREDICT_MS=$(echo "$TIMINGS"    | jq -r '.predict_ms // 0')
-T_TOTAL_MS=$(echo "$TIMINGS"      | jq -r '.total_ms // 0')
-PROMPT_TPS=$(echo "$TIMINGS"      | jq -r '.prompt_per_second // 0')
-PREDICT_TPS=$(echo "$TIMINGS"     | jq -r '.predicted_per_second // 0')
+T_PROMPT_MS=$(echo "$TIMINGS"  | jq -r '.prompt_ms // 0')
+T_PREDICT_MS=$(echo "$TIMINGS" | jq -r '.predict_ms // 0')
+T_TOTAL_MS=$(echo "$TIMINGS"   | jq -r '.total_ms // 0')
+PROMPT_TPS=$(echo "$TIMINGS"   | jq -r '.prompt_per_second // 0')
+PREDICT_TPS=$(echo "$TIMINGS"  | jq -r '.predicted_per_second // 0')
 
 # Server-side metrics
 KV_USAGE_POST=""
